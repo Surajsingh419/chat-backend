@@ -1,5 +1,5 @@
 // backend/server.js
-require('dotenv').config({ path: '../.env' });
+require('dotenv').config({ path: __dirname + '/.env' });
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
@@ -13,11 +13,20 @@ const authRoutes = require('./routes/auth');
 
 const app = express();
 const server = http.createServer(app);
-const io = socketIo(server, {
+
+const allowedOrigins = [
+  'https://chat-frontend-fawn-mu.vercel.app',
+  'http://localhost:3000'
+];
+
+app.use(cors({
+  origin: allowedOrigins,
+  credentials: true
+}));
+
+const io = require('socket.io')(server, {
   cors: {
-    origin: process.env.NODE_ENV === 'production' 
-      ? ['https://chat-frontend-fawn-mu.vercel.app'] 
-      : ['http://localhost:3000'],
+    origin: allowedOrigins,
     methods: ['GET', 'POST'],
     credentials: true
   }
@@ -26,12 +35,12 @@ const io = socketIo(server, {
 const PORT = process.env.PORT || 5000;
 
 // Middleware
-app.use(cors({
-  origin: process.env.NODE_ENV === 'production' 
-    ? ['https://chat-frontend-fawn-mu.vercel.app'] 
-    : ['http://localhost:3000'],
-  credentials: true
-}));
+app.use(
+  cors({
+    origin: allowedOrigins,
+    credentials: true,
+  })
+);
 app.use(express.json());
 
 // Routes
@@ -56,7 +65,7 @@ const socketAuth = async (socket, next) => {
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     const user = await User.findById(decoded.id);
-    
+
     if (!user) {
       return next(new Error('Authentication error'));
     }
@@ -80,20 +89,20 @@ io.on('connection', async (socket) => {
     await User.findByIdAndUpdate(socket.user._id, {
       isOnline: true,
       socketId: socket.id,
-      lastSeen: new Date()
+      lastSeen: new Date(),
     });
 
     // Add to online users
     onlineUsers.set(socket.user._id.toString(), {
       id: socket.user._id,
       username: socket.user.username,
-      socketId: socket.id
+      socketId: socket.id,
     });
 
     // Join general room
     socket.join('general');
 
-    // Send recent messages to the user
+    // Send recent messages
     const recentMessages = await Message.find({ room: 'general' })
       .sort({ createdAt: -1 })
       .limit(50)
@@ -102,51 +111,45 @@ io.on('connection', async (socket) => {
 
     socket.emit('recentMessages', recentMessages.reverse());
 
-    // Broadcast updated online users list
+    // Broadcast updated online users
     const onlineUsersList = Array.from(onlineUsers.values());
     io.to('general').emit('onlineUsers', onlineUsersList);
 
-    // Notify others that user joined
+    // Notify others user joined
     socket.broadcast.to('general').emit('userJoined', {
       username: socket.user.username,
-      message: `${socket.user.username} joined the chat`
+      message: `${socket.user.username} joined the chat`,
     });
 
-    // Handle sending messages
+    // Handle sendMessage
     socket.on('sendMessage', async (data) => {
       try {
         const { content } = data;
-        
-        if (!content || content.trim().length === 0) {
-          return;
-        }
-
+        if (!content || content.trim().length === 0) return;
         if (content.length > 1000) {
           socket.emit('error', { message: 'Message too long' });
           return;
         }
 
-        // Create message
         const message = new Message({
           content: content.trim(),
           sender: socket.user._id,
           senderUsername: socket.user.username,
-          room: 'general'
+          room: 'general',
         });
 
         await message.save();
 
-        // Broadcast message to all users in the room
         const messageData = {
           id: message._id,
           content: message.content,
           sender: {
             _id: socket.user._id,
-            username: socket.user.username
+            username: socket.user.username,
           },
           senderUsername: socket.user.username,
           createdAt: message.createdAt,
-          room: message.room
+          room: message.room,
         };
 
         io.to('general').emit('message', messageData);
@@ -156,14 +159,14 @@ io.on('connection', async (socket) => {
       }
     });
 
-    // Handle typing indicators
+    // Typing indicators
     socket.on('typing', () => {
       const typingKey = `${socket.user._id}-${socket.user.username}`;
       if (!typingUsers.has(typingKey)) {
         typingUsers.add(typingKey);
         socket.broadcast.to('general').emit('typing', {
           userId: socket.user._id,
-          username: socket.user.username
+          username: socket.user.username,
         });
       }
     });
@@ -174,50 +177,42 @@ io.on('connection', async (socket) => {
         typingUsers.delete(typingKey);
         socket.broadcast.to('general').emit('stopTyping', {
           userId: socket.user._id,
-          username: socket.user.username
+          username: socket.user.username,
         });
       }
     });
 
-    // Handle disconnection
+    // Handle disconnect
     socket.on('disconnect', async () => {
       console.log(`User ${socket.user.username} disconnected`);
-      
       try {
-        // Update user status
         await User.findByIdAndUpdate(socket.user._id, {
           isOnline: false,
           socketId: null,
-          lastSeen: new Date()
+          lastSeen: new Date(),
         });
 
-        // Remove from online users
         onlineUsers.delete(socket.user._id.toString());
 
-        // Remove from typing users
         const typingKey = `${socket.user._id}-${socket.user.username}`;
         typingUsers.delete(typingKey);
 
-        // Broadcast updated online users list
         const onlineUsersList = Array.from(onlineUsers.values());
         io.to('general').emit('onlineUsers', onlineUsersList);
 
-        // Notify others that user left
         socket.broadcast.to('general').emit('userLeft', {
           username: socket.user.username,
-          message: `${socket.user.username} left the chat`
+          message: `${socket.user.username} left the chat`,
         });
 
-        // Stop typing notification if user was typing
         socket.broadcast.to('general').emit('stopTyping', {
           userId: socket.user._id,
-          username: socket.user.username
+          username: socket.user.username,
         });
       } catch (error) {
         console.error('Disconnect error:', error);
       }
     });
-
   } catch (error) {
     console.error('Socket connection error:', error);
     socket.disconnect();
@@ -225,7 +220,8 @@ io.on('connection', async (socket) => {
 });
 
 // Connect to MongoDB
-mongoose.connect(process.env.MONGODB_URI)
+mongoose
+  .connect(process.env.MONGODB_URI)
   .then(() => {
     console.log('Connected to MongoDB');
     server.listen(PORT, () => {
@@ -240,16 +236,14 @@ mongoose.connect(process.env.MONGODB_URI)
 // Graceful shutdown
 process.on('SIGTERM', async () => {
   console.log('SIGTERM received, shutting down gracefully');
-  
-  // Update all online users to offline
   await User.updateMany(
     { isOnline: true },
     { isOnline: false, socketId: null, lastSeen: new Date() }
   );
-  
   await mongoose.connection.close();
   server.close(() => {
     console.log('Server closed');
     process.exit(0);
   });
 });
+
