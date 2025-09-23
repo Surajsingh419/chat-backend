@@ -16,7 +16,7 @@ const server = http.createServer(app);
 const io = socketIo(server, {
   cors: {
     origin: process.env.NODE_ENV === 'production' 
-      ? ['https://your-frontend-domain.com'] 
+      ? ['https://chat-frontend-fawn-mu.vercel.app'] 
       : ['http://localhost:3000'],
     methods: ['GET', 'POST'],
     credentials: true
