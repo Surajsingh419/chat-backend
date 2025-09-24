@@ -1,4 +1,4 @@
-// backend/server.js - Private Chat Only
+// backend/server.js - Private Chat with Read/Edited Support
 require('dotenv').config({ path: __dirname + '/.env' });
 const express = require('express');
 const http = require('http');
@@ -37,7 +37,7 @@ const io = require('socket.io')(server, {
 
 const PORT = process.env.PORT || 5000;
 
-// File upload configuration
+// -------------------- File Upload --------------------
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     const uploadDir = 'uploads/';
@@ -55,39 +55,24 @@ const storage = multer.diskStorage({
 const upload = multer({
   storage: storage,
   limits: {
-    fileSize: 10 * 1024 * 1024, // 10MB limit
+    fileSize: 10 * 1024 * 1024, // 10MB
   },
   fileFilter: (req, file, cb) => {
-    // Allow images, documents, and other common files
     const allowedTypes = /jpeg|jpg|png|gif|pdf|doc|docx|txt|mp4|mp3|zip/;
     const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
     const mimetype = allowedTypes.test(file.mimetype);
-    
-    if (mimetype && extname) {
-      return cb(null, true);
-    } else {
-      cb(new Error('File type not allowed'));
-    }
+    if (mimetype && extname) cb(null, true);
+    else cb(new Error('File type not allowed'));
   }
 });
 
-// Middleware
-app.use(cors({
-  origin: allowedOrigins,
-  credentials: true,
-}));
 app.use(express.json());
-
-// Serve uploaded files
 app.use('/uploads', express.static('uploads'));
 
-// File upload route
+// Upload endpoint
 app.post('/api/upload', upload.single('file'), (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded' });
-    }
-    
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
     res.json({
       filename: req.file.filename,
       originalName: req.file.originalname,
@@ -95,315 +80,247 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
       mimetype: req.file.mimetype,
       url: `/uploads/${req.file.filename}`
     });
-  } catch (error) {
+  } catch {
     res.status(500).json({ error: 'File upload failed' });
   }
 });
 
-// Routes
+// -------------------- Routes --------------------
 app.use('/api/auth', authRoutes);
 
-// Basic route
 app.get('/', (req, res) => {
   res.json({ message: 'Private Chat App Server Running!' });
 });
 
-// Store online users and their private chat rooms
+// -------------------- Online Users --------------------
 const onlineUsers = new Map();
-const typingUsers = new Map(); // Map for tracking typing in private chats
-const userRooms = new Map(); // Track which private rooms users are in
+const typingUsers = new Map();
+const userRooms = new Map();
+const userSocketMap = new Map();
 
-// Socket authentication middleware
+// -------------------- Socket Auth --------------------
 const socketAuth = async (socket, next) => {
   try {
     const token = socket.handshake.auth.token;
-    if (!token) {
-      return next(new Error('Authentication error'));
-    }
-
+    if (!token) return next(new Error('Authentication error'));
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     const user = await User.findById(decoded.id);
-
-    if (!user) {
-      return next(new Error('Authentication error'));
-    }
-
+    if (!user) return next(new Error('Authentication error'));
     socket.user = user;
     next();
-  } catch (error) {
+  } catch {
     next(new Error('Authentication error'));
   }
 };
-
-// Apply socket authentication
 io.use(socketAuth);
 
-// Helper function to generate private room name
-const getPrivateRoomName = (user1Id, user2Id) => {
-  return [user1Id, user2Id].sort().join('-private');
-};
+// Helper to create private room name
+const getPrivateRoomName = (user1, user2) =>
+  [user1, user2].sort().join('-private');
 
-// Socket.io connection handling
+// -------------------- Socket.io --------------------
 io.on('connection', async (socket) => {
-  console.log(`User ${socket.user.username} connected for private chat`);
+  console.log(`User ${socket.user.username} connected`);
 
   try {
-    // Update user status
     await User.findByIdAndUpdate(socket.user._id, {
       isOnline: true,
       socketId: socket.id,
       lastSeen: new Date(),
     });
 
-    // Add to online users
     onlineUsers.set(socket.user._id.toString(), {
       id: socket.user._id,
       username: socket.user.username,
       socketId: socket.id,
     });
-
-    // Initialize user rooms tracking
+    userSocketMap.set(socket.user._id.toString(), socket.id);
     userRooms.set(socket.id, new Set());
 
-    // Broadcast updated online users to all
-    const onlineUsersList = Array.from(onlineUsers.values());
-    io.emit('onlineUsers', onlineUsersList);
+    io.emit('onlineUsers', Array.from(onlineUsers.values()));
 
-    console.log(`User ${socket.user.username} is now online for private messaging`);
-
-    // Handle joining private chat
-    socket.on('joinPrivateChat', async (data) => {
+    // -------------------- Join Private Chat --------------------
+    socket.on('joinPrivateChat', async ({ targetUserId }) => {
       try {
-        const { targetUserId } = data;
         const privateRoomName = getPrivateRoomName(socket.user._id.toString(), targetUserId);
-        
-        // Leave any existing private rooms first
-        const currentRooms = userRooms.get(socket.id) || new Set();
-        currentRooms.forEach(roomName => {
-          socket.leave(roomName);
-        });
-        
-        // Join the new private room
         socket.join(privateRoomName);
-        userRooms.set(socket.id, new Set([privateRoomName]));
 
-        // Get recent private messages between these two users
-        const recentPrivateMessages = await PrivateMessage.find({
+        const rooms = userRooms.get(socket.id) || new Set();
+        rooms.add(privateRoomName);
+        userRooms.set(socket.id, rooms);
+
+        const recent = await PrivateMessage.find({
           $or: [
             { sender: socket.user._id, receiver: targetUserId },
             { sender: targetUserId, receiver: socket.user._id }
           ]
         })
-        .sort({ createdAt: -1 })
-        .limit(50)
-        .populate('sender', 'username')
-        .populate('receiver', 'username')
-        .lean();
+          .sort({ createdAt: -1 })
+          .limit(50)
+          .populate('sender', 'username')
+          .populate('receiver', 'username')
+          .lean();
 
         socket.emit('recentMessages', {
           room: privateRoomName,
-          messages: recentPrivateMessages.reverse(),
+          messages: recent.reverse(),
           isPrivate: true,
           targetUserId
         });
-
-        console.log(`User ${socket.user.username} joined private chat room: ${privateRoomName}`);
-      } catch (error) {
-        console.error('Join private chat error:', error);
+      } catch (err) {
+        console.error('joinPrivateChat error:', err);
         socket.emit('error', { message: 'Failed to join private chat' });
       }
     });
 
-    // Handle sendMessage (private messages only)
-    socket.on('sendMessage', async (data) => {
+    // -------------------- Send Message --------------------
+    socket.on('sendMessage', async ({ content, targetUserId, fileData, messageType = 'text' }) => {
       try {
-        const { content, targetUserId, fileData, messageType = 'text' } = data;
-        
-        if (!targetUserId) {
-          socket.emit('error', { message: 'Target user is required for private messages' });
-          return;
+        if (!targetUserId) return socket.emit('error', { message: 'Target user required' });
+        if (messageType === 'text') {
+          if (!content || !content.trim()) return;
+          if (content.length > 1000) return socket.emit('error', { message: 'Message too long' });
         }
 
-        if (messageType === 'text' && (!content || content.trim().length === 0)) {
-          return;
-        }
-        
-        if (messageType === 'text' && content.length > 1000) {
-          socket.emit('error', { message: 'Message too long' });
-          return;
-        }
-
-        // Create private message
         const privateMessage = new PrivateMessage({
-          content: messageType === 'text' ? content?.trim() : '',
+          content: messageType === 'text' ? content.trim() : undefined,
           sender: socket.user._id,
           receiver: targetUserId,
           messageType,
           fileData: fileData || null,
         });
 
-        const savedMessage = await privateMessage.save();
-        await savedMessage.populate('sender', 'username');
-        await savedMessage.populate('receiver', 'username');
+        const saved = await privateMessage.save();
+        await saved.populate('sender', 'username');
+        await saved.populate('receiver', 'username');
 
-        const messageData = {
-          id: savedMessage._id,
-          content: savedMessage.content,
-          sender: {
-            _id: socket.user._id,
-            username: socket.user.username,
-          },
-          receiver: {
-            _id: savedMessage.receiver._id,
-            username: savedMessage.receiver.username,
-          },
-          messageType: savedMessage.messageType,
-          fileData: savedMessage.fileData,
-          createdAt: savedMessage.createdAt,
+        const msg = {
+          id: saved._id,
+          content: saved.content,
+          messageType: saved.messageType,
+          fileData: saved.fileData,
+          senderId: socket.user._id.toString(),
+          receiverId: targetUserId,
+          senderUsername: socket.user.username,
+          receiverUsername: saved.receiver.username,
+          createdAt: saved.createdAt,
           isPrivate: true,
         };
 
-        // Send to both users in the private room
-        const privateRoomName = getPrivateRoomName(socket.user._id.toString(), targetUserId);
-        io.to(privateRoomName).emit('message', messageData);
+        const room = getPrivateRoomName(socket.user._id.toString(), targetUserId);
+        io.to(room).emit('message', msg);
 
-        console.log(`Private message sent between ${socket.user.username} and ${savedMessage.receiver.username}`);
+        const targetSocket = userSocketMap.get(targetUserId);
+        if (targetSocket) io.to(targetSocket).emit('message', msg);
 
-      } catch (error) {
-        console.error('Send private message error:', error);
-        socket.emit('error', { message: 'Failed to send private message' });
+      } catch (err) {
+        console.error('sendMessage error:', err);
+        socket.emit('error', { message: 'Failed to send message' });
       }
     });
 
-    // Handle typing indicators for private chats
-    socket.on('typing', (data) => {
-      const { targetUserId } = data;
-      
-      if (!targetUserId) return;
-      
-      const privateRoomName = getPrivateRoomName(socket.user._id.toString(), targetUserId);
-      
-      if (!typingUsers.has(privateRoomName)) {
-        typingUsers.set(privateRoomName, new Set());
-      }
-      
-      const roomTyping = typingUsers.get(privateRoomName);
-      const typingKey = `${socket.user._id}-${socket.user.username}`;
-      
-      if (!roomTyping.has(typingKey)) {
-        roomTyping.add(typingKey);
-        socket.broadcast.to(privateRoomName).emit('typing', {
-          userId: socket.user._id,
-          username: socket.user.username,
-          room: privateRoomName,
-        });
-      }
-    });
+    // -------------------- Mark as Read --------------------
+    socket.on('markAsRead', async ({ messageId }) => {
+      try {
+        const updated = await PrivateMessage.findByIdAndUpdate(
+          messageId,
+          { $addToSet: { readBy: { user: socket.user._id, readAt: new Date() } } },
+          { new: true }
+        ).populate('sender receiver', 'username');
 
-    socket.on('stopTyping', (data) => {
-      const { targetUserId } = data;
-      
-      if (!targetUserId) return;
-      
-      const privateRoomName = getPrivateRoomName(socket.user._id.toString(), targetUserId);
-      
-      if (typingUsers.has(privateRoomName)) {
-        const roomTyping = typingUsers.get(privateRoomName);
-        const typingKey = `${socket.user._id}-${socket.user.username}`;
-        
-        if (roomTyping.has(typingKey)) {
-          roomTyping.delete(typingKey);
-          socket.broadcast.to(privateRoomName).emit('stopTyping', {
-            userId: socket.user._id,
-            username: socket.user.username,
-            room: privateRoomName,
-          });
+        if (updated) {
+          const room = getPrivateRoomName(updated.sender._id.toString(), updated.receiver._id.toString());
+          io.to(room).emit('messageRead', updated);
         }
+      } catch (err) {
+        console.error('markAsRead error:', err);
       }
     });
 
-    // Handle disconnect
+    // -------------------- Edit Message --------------------
+    socket.on('editMessage', async ({ messageId, newContent }) => {
+      try {
+        const updated = await PrivateMessage.findByIdAndUpdate(
+          messageId,
+          { content: newContent, edited: true, editedAt: new Date() },
+          { new: true }
+        ).populate('sender receiver', 'username');
+
+        if (updated) {
+          const room = getPrivateRoomName(updated.sender._id.toString(), updated.receiver._id.toString());
+          io.to(room).emit('messageEdited', updated);
+        }
+      } catch (err) {
+        console.error('editMessage error:', err);
+      }
+    });
+
+    // -------------------- Typing Indicators --------------------
+    socket.on('typing', ({ targetUserId }) => {
+      if (!targetUserId) return;
+      const room = getPrivateRoomName(socket.user._id.toString(), targetUserId);
+      socket.broadcast.to(room).emit('typing', { userId: socket.user._id, username: socket.user.username, room });
+    });
+
+    socket.on('stopTyping', ({ targetUserId }) => {
+      if (!targetUserId) return;
+      const room = getPrivateRoomName(socket.user._id.toString(), targetUserId);
+      socket.broadcast.to(room).emit('stopTyping', { userId: socket.user._id, username: socket.user.username, room });
+    });
+
+    // -------------------- Disconnect --------------------
     socket.on('disconnect', async () => {
-      console.log(`User ${socket.user.username} disconnected from private chat`);
+      console.log(`User ${socket.user.username} disconnected`);
       try {
         await User.findByIdAndUpdate(socket.user._id, {
           isOnline: false,
           socketId: null,
           lastSeen: new Date(),
         });
-
         onlineUsers.delete(socket.user._id.toString());
-
-        // Clean up typing indicators for all private rooms this user was in
-        const userSocketRooms = userRooms.get(socket.id) || new Set();
-        userSocketRooms.forEach(roomName => {
-          if (typingUsers.has(roomName)) {
-            const roomTyping = typingUsers.get(roomName);
-            const typingKey = `${socket.user._id}-${socket.user.username}`;
-            roomTyping.delete(typingKey);
-            
-            // If no one is typing in this room anymore, clean it up
-            if (roomTyping.size === 0) {
-              typingUsers.delete(roomName);
-            }
-          }
-        });
-
+        userSocketMap.delete(socket.user._id.toString());
         userRooms.delete(socket.id);
 
-        // Broadcast updated online users list
-        const onlineUsersList = Array.from(onlineUsers.values());
-        io.emit('onlineUsers', onlineUsersList);
-
-        console.log(`User ${socket.user.username} removed from private chat system`);
-
-      } catch (error) {
-        console.error('Disconnect error:', error);
+        io.emit('onlineUsers', Array.from(onlineUsers.values()));
+      } catch (err) {
+        console.error('disconnect error:', err);
       }
     });
 
-  } catch (error) {
-    console.error('Socket connection error:', error);
+  } catch (err) {
+    console.error('connection error:', err);
     socket.disconnect();
   }
 });
 
-// Connect to MongoDB
+// -------------------- MongoDB --------------------
 mongoose
   .connect(process.env.MONGODB_URI)
   .then(() => {
     console.log('Connected to MongoDB');
-    server.listen(PORT, () => {
-      console.log(`Private Chat Server running on port ${PORT}`);
-    });
+    server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
   })
-  .catch((error) => {
-    console.error('MongoDB connection error:', error);
+  .catch((err) => {
+    console.error('MongoDB connection error:', err);
     process.exit(1);
   });
 
-// Graceful shutdown
+// -------------------- Graceful Shutdown --------------------
 process.on('SIGTERM', async () => {
-  console.log('SIGTERM received, shutting down private chat server gracefully');
+  console.log('Shutting down gracefully...');
   await User.updateMany(
     { isOnline: true },
     { isOnline: false, socketId: null, lastSeen: new Date() }
   );
   await mongoose.connection.close();
-  server.close(() => {
-    console.log('Private chat server closed');
-    process.exit(0);
-  });
+  server.close(() => process.exit(0));
 });
 
-// Additional endpoint to get user's chat history with another user
+// -------------------- Chat History API --------------------
 app.get('/api/chat-history/:userId', async (req, res) => {
   try {
     const token = req.headers.authorization?.split(' ')[1];
-    if (!token) {
-      return res.status(401).json({ error: 'No token provided' });
-    }
-
+    if (!token) return res.status(401).json({ error: 'No token provided' });
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     const currentUserId = decoded.id;
     const { userId: targetUserId } = req.params;
@@ -414,14 +331,15 @@ app.get('/api/chat-history/:userId', async (req, res) => {
         { sender: targetUserId, receiver: currentUserId }
       ]
     })
-    .sort({ createdAt: -1 })
-    .limit(100)
-    .populate('sender', 'username')
-    .populate('receiver', 'username');
+      .sort({ createdAt: -1 })
+      .limit(100)
+      .populate('sender', 'username')
+      .populate('receiver', 'username')
+      .lean();
 
     res.json({ messages: messages.reverse() });
-  } catch (error) {
-    console.error('Get chat history error:', error);
+  } catch (err) {
+    console.error('chat-history error:', err);
     res.status(500).json({ error: 'Failed to get chat history' });
   }
 });
