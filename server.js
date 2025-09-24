@@ -94,7 +94,6 @@ app.get('/', (req, res) => {
 
 // -------------------- Online Users --------------------
 const onlineUsers = new Map();
-const typingUsers = new Map();
 const userRooms = new Map();
 const userSocketMap = new Map();
 
@@ -133,6 +132,8 @@ io.on('connection', async (socket) => {
       id: socket.user._id,
       username: socket.user.username,
       socketId: socket.id,
+      isOnline: true,
+      lastSeen: new Date(),
     });
     userSocketMap.set(socket.user._id.toString(), socket.id);
     userRooms.set(socket.id, new Set());
@@ -208,10 +209,9 @@ io.on('connection', async (socket) => {
         };
 
         const room = getPrivateRoomName(socket.user._id.toString(), targetUserId);
-        io.to(room).emit('message', msg);
 
-        const targetSocket = userSocketMap.get(targetUserId);
-        if (targetSocket) io.to(targetSocket).emit('message', msg);
+        // ✅ Only one emit (no duplicate)
+        io.to(room).emit('message', msg);
 
       } catch (err) {
         console.error('sendMessage error:', err);
@@ -277,7 +277,15 @@ io.on('connection', async (socket) => {
           socketId: null,
           lastSeen: new Date(),
         });
-        onlineUsers.delete(socket.user._id.toString());
+
+        // ✅ Update instead of delete
+        onlineUsers.set(socket.user._id.toString(), {
+          id: socket.user._id,
+          username: socket.user.username,
+          socketId: null,
+          isOnline: false,
+          lastSeen: new Date(),
+        });
         userSocketMap.delete(socket.user._id.toString());
         userRooms.delete(socket.id);
 
@@ -343,3 +351,4 @@ app.get('/api/chat-history/:userId', async (req, res) => {
     res.status(500).json({ error: 'Failed to get chat history' });
   }
 });
+
