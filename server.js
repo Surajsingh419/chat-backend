@@ -1,4 +1,4 @@
-// backend/server.js - Private Chat with Read/Edited Support
+// backend/server.js - Updated to properly handle all users with online/offline status
 require('dotenv').config({ path: __dirname + '/.env' });
 const express = require('express');
 const http = require('http');
@@ -92,10 +92,32 @@ app.get('/', (req, res) => {
   res.json({ message: 'Private Chat App Server Running!' });
 });
 
-// -------------------- Online Users --------------------
-const onlineUsers = new Map();
-const userRooms = new Map();
+// -------------------- User Management --------------------
 const userSocketMap = new Map();
+const userRooms = new Map();
+
+// Helper function to get all users with their online status
+const getAllUsersWithStatus = async () => {
+  try {
+    const allUsers = await User.find({}, 'username isOnline lastSeen').lean();
+    return allUsers.map(user => ({
+      id: user._id.toString(),
+      username: user.username,
+      isOnline: user.isOnline || false,
+      lastSeen: user.lastSeen,
+      socketId: userSocketMap.get(user._id.toString()) || null
+    }));
+  } catch (error) {
+    console.error('Error fetching all users:', error);
+    return [];
+  }
+};
+
+// Helper function to broadcast all users to all connected clients
+const broadcastAllUsers = async () => {
+  const allUsers = await getAllUsersWithStatus();
+  io.emit('allUsers', allUsers);
+};
 
 // -------------------- Socket Auth --------------------
 const socketAuth = async (socket, next) => {
@@ -122,23 +144,19 @@ io.on('connection', async (socket) => {
   console.log(`User ${socket.user.username} connected`);
 
   try {
+    // Update user status to online
     await User.findByIdAndUpdate(socket.user._id, {
       isOnline: true,
       socketId: socket.id,
       lastSeen: new Date(),
     });
 
-    onlineUsers.set(socket.user._id.toString(), {
-      id: socket.user._id,
-      username: socket.user.username,
-      socketId: socket.id,
-      isOnline: true,
-      lastSeen: new Date(),
-    });
+    // Store user socket mapping
     userSocketMap.set(socket.user._id.toString(), socket.id);
     userRooms.set(socket.id, new Set());
 
-    io.emit('onlineUsers', Array.from(onlineUsers.values()));
+    // Broadcast updated user list to all connected clients
+    await broadcastAllUsers();
 
     // -------------------- Join Private Chat --------------------
     socket.on('joinPrivateChat', async ({ targetUserId }) => {
@@ -209,8 +227,6 @@ io.on('connection', async (socket) => {
         };
 
         const room = getPrivateRoomName(socket.user._id.toString(), targetUserId);
-
-        // ✅ Only one emit (no duplicate)
         io.to(room).emit('message', msg);
 
       } catch (err) {
@@ -268,6 +284,12 @@ io.on('connection', async (socket) => {
       socket.broadcast.to(room).emit('stopTyping', { userId: socket.user._id, username: socket.user.username, room });
     });
 
+    // -------------------- Get All Users --------------------
+    socket.on('getAllUsers', async () => {
+      const allUsers = await getAllUsersWithStatus();
+      socket.emit('allUsers', allUsers);
+    });
+
     // -------------------- Disconnect --------------------
     socket.on('disconnect', async () => {
       console.log(`User ${socket.user.username} disconnected`);
@@ -278,18 +300,11 @@ io.on('connection', async (socket) => {
           lastSeen: new Date(),
         });
 
-        // ✅ Update instead of delete
-        onlineUsers.set(socket.user._id.toString(), {
-          id: socket.user._id,
-          username: socket.user.username,
-          socketId: null,
-          isOnline: false,
-          lastSeen: new Date(),
-        });
         userSocketMap.delete(socket.user._id.toString());
         userRooms.delete(socket.id);
 
-        io.emit('onlineUsers', Array.from(onlineUsers.values()));
+        // Broadcast updated user list after disconnect
+        await broadcastAllUsers();
       } catch (err) {
         console.error('disconnect error:', err);
       }
@@ -349,6 +364,21 @@ app.get('/api/chat-history/:userId', async (req, res) => {
   } catch (err) {
     console.error('chat-history error:', err);
     res.status(500).json({ error: 'Failed to get chat history' });
+  }
+});
+
+// -------------------- Get All Users API --------------------
+app.get('/api/users', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'No token provided' });
+    
+    jwt.verify(token, process.env.JWT_SECRET);
+    const allUsers = await getAllUsersWithStatus();
+    res.json({ users: allUsers });
+  } catch (err) {
+    console.error('get users error:', err);
+    res.status(500).json({ error: 'Failed to get users' });
   }
 });
 
